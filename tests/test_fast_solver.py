@@ -199,6 +199,15 @@ def test_self_test_passes():
     fast_solver.self_test()
 
 
+def test_near_best_cliques_are_valid():
+    encoded = load("general_0.2")
+    result = fast_solver.solve(encoded, 1.0, threads=4, extra_args=["--near"])
+    assert result.near_cliques, "--near reported no size best-1 cliques"
+    assert all(len(c) == result.best_size - 1 for c in result.near_cliques)
+    assert all(validator_accepts(encoded, c) for c in result.near_cliques[:20])
+    assert not fast_solver.solve(encoded, 0.3, threads=2).near_cliques  # off by default
+
+
 def test_miner_defaults_and_budget():
     import argparse
     import types

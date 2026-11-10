@@ -17,6 +17,7 @@
 //   N <n>                          number of vertices
 //   B <size> <ms> <v1> ... <vk>    new best maximal clique, flushed at once (usable if killed)
 //   R <hits> <v1> ... <vk>         final distinct best cliques (verified), rarest first
+//   Q <hits> <v1> ... <vk>         with --near: distinct maximal cliques of size best - 1
 //   S key=value ...                statistics
 //   E                              end of output
 //   X <message>                    error (exit code != 0)
@@ -275,6 +276,41 @@ enum class Phase { kRandom, kPenalty, kGreedy };
 // Per-thread cap on stored clique vertices (1 MB), whatever the clique size.
 constexpr int64_t kMaxStoredVertices = int64_t{1} << 18;
 
+// Distinct cliques of one size with visit counts, keyed by Zobrist hash.
+struct CliqueStore {
+  std::vector<std::vector<int>> cliques;
+  std::vector<int> hits;
+  std::unordered_map<uint64_t, int> seen;
+
+  void Clear() {
+    cliques.clear();
+    hits.clear();
+    seen.clear();
+  }
+  // Count a visit. Stores a sorted copy if the clique is new and within the caps; returns it.
+  const std::vector<int>* Visit(uint64_t hash, const std::vector<int>& members, int cap,
+                                uint64_t* dropped) {
+    const auto it = seen.find(hash);
+    if (it != seen.end()) {
+      ++hits[it->second];
+      return nullptr;
+    }
+    // Bound memory and the post-deadline merge on graphs with huge numbers of large cliques.
+    if (static_cast<int>(cliques.size()) >= cap ||
+        static_cast<int64_t>(cliques.size() + 1) * static_cast<int64_t>(members.size()) >
+            kMaxStoredVertices) {
+      ++*dropped;
+      return nullptr;
+    }
+    std::vector<int> sorted(members);
+    std::sort(sorted.begin(), sorted.end());
+    seen.emplace(hash, static_cast<int>(cliques.size()));
+    cliques.push_back(std::move(sorted));
+    hits.push_back(1);
+    return &cliques.back();
+  }
+};
+
 // Iterations per phase in one PLS cycle: random, penalty, greedy.
 // Default is random selection only. On CliqueAI-like G(900, 0.735) graphs it reached the best
 // clique with median 1.4 s / p90 3.3 s single-threaded, against 3.0 s / 7.8 s for the original
@@ -289,7 +325,7 @@ struct Schedule {
 class LocalSearch {
  public:
   LocalSearch(const Graph& g, SharedState& shared, uint64_t seed, int store_cap,
-              int penalty_delay, Schedule schedule)
+              int penalty_delay, Schedule schedule, bool record_near)
       : g_(g),
         sh_(shared),
         rng_(seed),
@@ -305,7 +341,8 @@ class LocalSearch {
         tabu_(n_, 0),
         orig_(n_, 0),
         zob_(n_),
-        add_bits_(g.W, 0) {
+        add_bits_(g.W, 0),
+        record_near_(record_near) {
     for (auto& z : zob_) z = rng_();
     c_.reserve(n_);
     add_.reserve(n_);
@@ -338,8 +375,8 @@ class LocalSearch {
   }
 
   int best() const { return best_; }
-  const std::vector<std::vector<int>>& cliques() const { return cliques_; }
-  const std::vector<int>& hits() const { return hits_; }
+  const CliqueStore& best_store() const { return best_store_; }
+  const CliqueStore& near_store() const { return near_; }
   uint64_t iterations() const { return iterations_; }
   uint64_t dropped() const { return dropped_; }
 
@@ -455,33 +492,25 @@ class LocalSearch {
     return best_v;
   }
 
-  // Store the current clique if it is maximal and at least as large as the best so far.
+  // Called whenever C is maximal: count/store it if it has the best size so far, or (with
+  // --near) one less than the best size.
   void Record() {
     const int size = static_cast<int>(c_.size());
-    if (size < best_) return;
     if (size > best_) {
+      if (record_near_ && size == best_ + 1) {
+        std::swap(near_, best_store_);  // the old best cliques are now one below the best
+      } else {
+        near_.Clear();
+      }
+      best_store_.Clear();
       best_ = size;
-      cliques_.clear();
-      hits_.clear();
-      seen_.clear();
     }
-    const auto it = seen_.find(hash_);
-    if (it != seen_.end()) {
-      ++hits_[it->second];
-      return;
+    if (size == best_) {
+      const std::vector<int>* stored = best_store_.Visit(hash_, c_, store_cap_, &dropped_);
+      if (stored && size > sh_.best.load(std::memory_order_relaxed)) sh_.Publish(*stored);
+    } else if (record_near_ && size == best_ - 1) {
+      near_.Visit(hash_, c_, store_cap_, &dropped_);
     }
-    // Bound memory and the post-deadline merge on graphs with huge numbers of large cliques.
-    if (static_cast<int>(cliques_.size()) >= store_cap_ ||
-        static_cast<int64_t>(cliques_.size() + 1) * size > kMaxStoredVertices) {
-      ++dropped_;
-      return;
-    }
-    std::vector<int> sorted(c_.begin(), c_.end());
-    std::sort(sorted.begin(), sorted.end());
-    if (size > sh_.best.load(std::memory_order_relaxed)) sh_.Publish(sorted);
-    seen_.emplace(hash_, static_cast<int>(cliques_.size()));
-    cliques_.push_back(std::move(sorted));
-    hits_.push_back(1);
   }
 
   // One DLS-MC iteration: expand until maximal, then plateau-swap while that keeps opening
@@ -558,9 +587,8 @@ class LocalSearch {
   uint64_t penalty_updates_ = 0;
 
   int best_ = 0;
-  std::vector<std::vector<int>> cliques_;
-  std::vector<int> hits_;
-  std::unordered_map<uint64_t, int> seen_;
+  const bool record_near_;
+  CliqueStore best_store_, near_;
   uint64_t iterations_ = 0;
   uint64_t dropped_ = 0;
 };
@@ -712,6 +740,7 @@ struct Options {
   Schedule schedule;
   int target = 0;
   bool enumerate = false;
+  bool near = false;  // also report maximal cliques one smaller than the best (Q lines)
   std::string mode = "ls";
 };
 
@@ -747,6 +776,7 @@ Options ParseArgs(int argc, char** argv) {
       else if (a == "--target") o.target = std::stoi(value());
       else if (a == "--mode") o.mode = value();
       else if (a == "--enumerate") o.enumerate = true;
+      else if (a == "--near") o.near = true;
       else Fail("unknown argument " + a);
     } catch (const std::exception&) {
       Fail("bad value for " + a);
@@ -791,11 +821,18 @@ struct LsStats {
   uint64_t dropped = 0;
 };
 
-LsStats RunLocalSearch(const Graph& g, const Options& o, SharedState& sh, Pool& pool) {
+void AddAll(Pool& pool, const CliqueStore& store) {
+  for (size_t i = 0; i < store.cliques.size(); ++i) pool.Add(store.cliques[i], store.hits[i]);
+}
+
+// `near_pool` (with --near) receives the distinct maximal cliques of size best - 1.
+LsStats RunLocalSearch(const Graph& g, const Options& o, SharedState& sh, Pool& pool,
+                       Pool* near_pool) {
   std::vector<std::unique_ptr<LocalSearch>> workers;
   for (int t = 0; t < o.threads; ++t)
     workers.emplace_back(new LocalSearch(g, sh, o.seed + 0x9e3779b97f4a7c15ULL * (t + 1),
-                                         o.store_cap, o.penalty_delay, o.schedule));
+                                         o.store_cap, o.penalty_delay, o.schedule,
+                                         near_pool != nullptr));
   std::vector<std::thread> threads;
   for (int t = 1; t < o.threads; ++t) threads.emplace_back([&workers, t] { workers[t]->Run(); });
   workers[0]->Run();
@@ -807,15 +844,19 @@ LsStats RunLocalSearch(const Graph& g, const Options& o, SharedState& sh, Pool& 
   for (const auto& w : workers) {
     stats.iterations += w->iterations();
     stats.dropped += w->dropped();
-    if (w->best() != global_best) continue;  // only best-size cliques are merged
-    for (size_t i = 0; i < w->cliques().size(); ++i) pool.Add(w->cliques()[i], w->hits()[i]);
+    if (w->best() == global_best) {  // only best-size cliques are merged
+      AddAll(pool, w->best_store());
+      if (near_pool) AddAll(*near_pool, w->near_store());
+    } else if (near_pool && w->best() == global_best - 1) {
+      AddAll(*near_pool, w->best_store());
+    }
   }
   return stats;
 }
 
-// Print up to `report` verified cliques, rarest first. Only printed ones are verified, which
-// keeps the work after the deadline bounded.
-int PrintResults(const Graph& g, const Pool& pool, int report) {
+// Print up to `report` verified cliques, rarest first, as `tag` lines. Only printed ones are
+// verified, which keeps the work after the deadline bounded.
+int PrintResults(const Graph& g, const Pool& pool, int report, char tag = 'R') {
   std::vector<int> idx(pool.cliques.size());
   for (size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<int>(i);
   std::stable_sort(idx.begin(), idx.end(),
@@ -824,7 +865,7 @@ int PrintResults(const Graph& g, const Pool& pool, int report) {
   for (int i : idx) {
     if (printed >= report) break;
     if (!IsMaximalClique(g, pool.cliques[i])) continue;  // never expected; guard the protocol
-    std::printf("R %d", pool.hits[i]);
+    std::printf("%c %d", tag, pool.hits[i]);
     for (int v : pool.cliques[i]) std::printf(" %d", v);
     std::printf("\n");
     ++printed;
@@ -864,17 +905,19 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  Pool pool;
+  Pool pool, near_pool;
   LsStats ls_stats;
   int reported = 0;
   if (o.mode == "ls") {
-    ls_stats = RunLocalSearch(g, o, sh, pool);
+    ls_stats = RunLocalSearch(g, o, sh, pool, o.near ? &near_pool : nullptr);
     reported = PrintResults(g, pool, o.report);
+    const int near_reported = o.near ? PrintResults(g, near_pool, o.report, 'Q') : 0;
     std::printf(
-        "S mode=ls n=%d edges=%lld threads=%d best=%d distinct=%d reported=%d iterations=%llu "
-        "dropped=%llu decode_ms=%.1f time_ms=%.1f\n",
+        "S mode=ls n=%d edges=%lld threads=%d best=%d distinct=%d reported=%d near_distinct=%d "
+        "near_reported=%d iterations=%llu dropped=%llu decode_ms=%.1f time_ms=%.1f\n",
         g.n, static_cast<long long>(g.edges()), o.threads, pool.best,
         static_cast<int>(pool.cliques.size()), reported,
+        static_cast<int>(near_pool.cliques.size()), near_reported,
         static_cast<unsigned long long>(ls_stats.iterations),
         static_cast<unsigned long long>(ls_stats.dropped), decode_ms, sh.ElapsedMs());
   } else {  // exact
@@ -882,7 +925,7 @@ int main(int argc, char** argv) {
     const double warm = std::min(1.0, 0.1 * o.time_limit);
     sh.deadline = std::min(full_deadline, sh.start + std::chrono::duration_cast<Clock::duration>(
                                                          std::chrono::duration<double>(warm)));
-    ls_stats = RunLocalSearch(g, o, sh, pool);
+    ls_stats = RunLocalSearch(g, o, sh, pool, nullptr);
     sh.deadline = full_deadline;
     sh.stop = false;
     ExactSolver exact(g, sh, o.enumerate, o.store_cap);

@@ -43,6 +43,8 @@ class SolverResult:
     best_size: int = 0
     cliques: list[list[int]] = field(default_factory=list)  # distinct best cliques, rarest first
     hits: list[int] = field(default_factory=list)  # visits per clique (index-aligned)
+    near_cliques: list[list[int]] = field(default_factory=list)  # --near: size best - 1
+    near_hits: list[int] = field(default_factory=list)
     stats: dict[str, str] = field(default_factory=dict)
     complete: bool = False  # solver exited normally (False: killed, partial output)
     elapsed: float = 0.0
@@ -172,11 +174,16 @@ def parse_output(text: str) -> SolverResult:
                 first_seen_ms[size] = min(ms, first_seen_ms.get(size, ms))
                 if size > len(best_partial):
                     best_partial = vertices
-            elif tag == "R":
+            elif tag in ("R", "Q"):
                 parts = [int(v) for v in rest.split()]
                 if len(parts) >= 2:
-                    result.hits.append(parts[0])
-                    result.cliques.append(parts[1:])
+                    hits, cliques = (
+                        (result.hits, result.cliques)
+                        if tag == "R"
+                        else (result.near_hits, result.near_cliques)
+                    )
+                    hits.append(parts[0])
+                    cliques.append(parts[1:])
             elif tag == "S":
                 for item in rest.split():
                     key, _, value = item.partition("=")
@@ -195,6 +202,13 @@ def parse_output(text: str) -> SolverResult:
         result.cliques, result.hits = [best_partial], [1]
     result.best_size = max((len(c) for c in result.cliques), default=0)
     result.time_to_best_ms = first_seen_ms.get(result.best_size)
+    kept_near = [
+        (c, h)
+        for c, h in zip(result.near_cliques, result.near_hits)
+        if len(c) == result.best_size - 1
+    ]
+    result.near_cliques = [c for c, _ in kept_near]
+    result.near_hits = [h for _, h in kept_near]
     return result
 
 
