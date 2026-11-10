@@ -272,6 +272,9 @@ struct SharedState {
 
 enum class Phase { kRandom, kPenalty, kGreedy };
 
+// Per-thread cap on stored clique vertices (1 MB), whatever the clique size.
+constexpr int64_t kMaxStoredVertices = int64_t{1} << 18;
+
 // Iterations per phase in one PLS cycle: random, penalty, greedy.
 // Default is random selection only. On CliqueAI-like G(900, 0.735) graphs it reached the best
 // clique with median 1.4 s / p90 3.3 s single-threaded, against 3.0 s / 7.8 s for the original
@@ -318,6 +321,10 @@ class LocalSearch {
                  {Phase::kPenalty, schedule_.penalty},
                  {Phase::kGreedy, schedule_.greedy}};
     if (n_ == 0) return;
+    // Always produce at least one maximal clique, even if decoding ate the whole budget: any
+    // valid answer scores more than none.
+    Iterate(Phase::kRandom);
+    Perturb(Phase::kRandom);
     if (schedule_.random + schedule_.penalty + schedule_.greedy <= 0) return;
     while (true) {
       for (const auto& step : steps) {
@@ -463,7 +470,9 @@ class LocalSearch {
       ++hits_[it->second];
       return;
     }
-    if (static_cast<int>(cliques_.size()) >= store_cap_) {
+    // Bound memory and the post-deadline merge on graphs with huge numbers of large cliques.
+    if (static_cast<int>(cliques_.size()) >= store_cap_ ||
+        static_cast<int64_t>(cliques_.size() + 1) * size > kMaxStoredVertices) {
       ++dropped_;
       return;
     }
@@ -793,30 +802,34 @@ LsStats RunLocalSearch(const Graph& g, const Options& o, SharedState& sh, Pool& 
   for (auto& th : threads) th.join();
 
   LsStats stats;
+  int global_best = 0;
+  for (const auto& w : workers) global_best = std::max(global_best, w->best());
   for (const auto& w : workers) {
     stats.iterations += w->iterations();
     stats.dropped += w->dropped();
+    if (w->best() != global_best) continue;  // only best-size cliques are merged
     for (size_t i = 0; i < w->cliques().size(); ++i) pool.Add(w->cliques()[i], w->hits()[i]);
   }
   return stats;
 }
 
-void PrintResults(const Graph& g, const Pool& pool, int report, int* verified_out) {
+// Print up to `report` verified cliques, rarest first. Only printed ones are verified, which
+// keeps the work after the deadline bounded.
+int PrintResults(const Graph& g, const Pool& pool, int report) {
   std::vector<int> idx(pool.cliques.size());
   for (size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<int>(i);
   std::stable_sort(idx.begin(), idx.end(),
                    [&](int a, int b) { return pool.hits[a] < pool.hits[b]; });
-  int printed = 0, verified = 0;
+  int printed = 0;
   for (int i : idx) {
+    if (printed >= report) break;
     if (!IsMaximalClique(g, pool.cliques[i])) continue;  // never expected; guard the protocol
-    ++verified;
-    if (printed >= report) continue;
     std::printf("R %d", pool.hits[i]);
     for (int v : pool.cliques[i]) std::printf(" %d", v);
     std::printf("\n");
     ++printed;
   }
-  *verified_out = verified;
+  return printed;
 }
 
 }  // namespace
@@ -853,14 +866,15 @@ int main(int argc, char** argv) {
 
   Pool pool;
   LsStats ls_stats;
-  int verified = 0;
+  int reported = 0;
   if (o.mode == "ls") {
     ls_stats = RunLocalSearch(g, o, sh, pool);
-    PrintResults(g, pool, o.report, &verified);
+    reported = PrintResults(g, pool, o.report);
     std::printf(
-        "S mode=ls n=%d edges=%lld threads=%d best=%d distinct=%d iterations=%llu dropped=%llu "
-        "decode_ms=%.1f time_ms=%.1f\n",
-        g.n, static_cast<long long>(g.edges()), o.threads, pool.best, verified,
+        "S mode=ls n=%d edges=%lld threads=%d best=%d distinct=%d reported=%d iterations=%llu "
+        "dropped=%llu decode_ms=%.1f time_ms=%.1f\n",
+        g.n, static_cast<long long>(g.edges()), o.threads, pool.best,
+        static_cast<int>(pool.cliques.size()), reported,
         static_cast<unsigned long long>(ls_stats.iterations),
         static_cast<unsigned long long>(ls_stats.dropped), decode_ms, sh.ElapsedMs());
   } else {  // exact
@@ -874,10 +888,11 @@ int main(int argc, char** argv) {
     ExactSolver exact(g, sh, o.enumerate, o.store_cap);
     exact.Solve(pool.best);
     for (const auto& c : exact.cliques()) pool.Add(c, 1);
-    PrintResults(g, pool, o.report, &verified);
-    std::printf("S mode=exact n=%d best=%d proved=%d enumerate=%d distinct=%d nodes=%llu "
-                "time_ms=%.1f\n",
-                g.n, pool.best, exact.proved() ? 1 : 0, o.enumerate ? 1 : 0, verified,
+    reported = PrintResults(g, pool, o.report);
+    std::printf("S mode=exact n=%d best=%d proved=%d enumerate=%d distinct=%d reported=%d "
+                "nodes=%llu time_ms=%.1f\n",
+                g.n, pool.best, exact.proved() ? 1 : 0, o.enumerate ? 1 : 0,
+                static_cast<int>(pool.cliques.size()), reported,
                 static_cast<unsigned long long>(exact.nodes()), sh.ElapsedMs());
   }
   std::printf("E\n");

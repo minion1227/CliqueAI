@@ -37,7 +37,7 @@ The miner answers with a compiled local-search solver ([fast_solver](CliqueAI/cl
 
 Options: `--solver.threads` (0 = all cores, split across overlapping requests), `--solver.safety_margin` (seconds reserved for the network, default 1.0 plus 5% of the timeout), `--solver.pick rarest|random`, `--solver.schedule R,P,G` (local-search phase mix; the default random-only selection measured fastest on CliqueAI's random graphs).
 
-If you run a modified miner, pass `--neuron.autoupdate 0`. Auto-update pulls `origin/main` and restarts whenever your HEAD differs from it.
+This miner defaults to `--neuron.autoupdate 0`: auto-update pulls `origin/main` and restarts whenever your HEAD differs from it, which would restart-loop a modified miner. Watch upstream releases yourself. The miner refuses to start if the solver cannot be built or fails its self-test.
 
 ```
 python -m pytest tests/test_fast_solver.py   # correctness against the validator's own checks

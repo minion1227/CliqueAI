@@ -11,8 +11,9 @@ from CliqueAI.graph.codec import GraphCodec
 from CliqueAI.protocol import MaximumCliqueOfLambdaGraph
 from common.base.miner import BaseMinerNeuron
 
-# Longest the validator's clock may plausibly run ahead of ours in the request nonce (seconds).
-MAX_NONCE_AGE = 5.0
+# Most upload + axon-verification time credited from the validator's nonce (seconds). Caps the
+# damage when a validator's clock runs behind ours.
+MAX_TRANSIT = 1.5
 MIN_BUDGET = 0.2
 
 
@@ -30,6 +31,10 @@ class Miner(BaseMinerNeuron):
     @classmethod
     def add_args(cls, parser):
         super().add_args(parser)
+        # Auto-update restarts the miner whenever HEAD differs from origin/main, which is always
+        # true on this branch: with it on, the miner restart-loops. Pass --neuron.autoupdate 1
+        # only when running unmodified upstream code.
+        parser.set_defaults(**{"neuron.autoupdate": 0})
         parser.add_argument(
             "--solver.threads",
             type=int,
@@ -67,15 +72,27 @@ class Miner(BaseMinerNeuron):
             priority_fn=self.priority_graph,
         )
         schedule = self.config.solver.schedule
-        if schedule and not re.fullmatch(r"\d+,\d+,\d+", schedule):
-            raise ValueError(f"--solver.schedule must look like 'R,P,G' (e.g. 1,0,0), got {schedule!r}")
+        if schedule and (
+            not re.fullmatch(r"\d+,\d+,\d+", schedule)
+            or not any(int(x) for x in schedule.split(","))
+        ):
+            raise ValueError(
+                f"--solver.schedule must look like 'R,P,G' with a non-zero phase (e.g. 1,0,0), "
+                f"got {schedule!r}"
+            )
+        if self.config.neuron.autoupdate:
+            bt.logging.warning(
+                "Auto-update is on: the miner restarts whenever HEAD differs from origin/main."
+            )
         self.rng = random.Random()
-        self.cpu_count = os.cpu_count() or 1
+        self.cpu_count = (
+            len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+        ) or 1
         self.active_requests = 0
-        try:
-            bt.logging.info(f"Clique solver ready: {fast_solver.ensure_built()}")
-        except Exception as e:
-            bt.logging.error(f"Clique solver unavailable, answers will come from the slow fallback: {e}")
+        # Fail fast: a miner stuck on the greedy fallback looks alive but scores near zero.
+        solver_path = fast_solver.ensure_built()
+        fast_solver.self_test()
+        bt.logging.info(f"Clique solver ready and self-tested: {solver_path}")
 
     def time_budget(self, synapse: MaximumCliqueOfLambdaGraph) -> float:
         """Seconds the solver may run so the answer reaches the validator before its timeout."""
@@ -84,9 +101,11 @@ class Miner(BaseMinerNeuron):
         start = now
         nonce = synapse.dendrite.nonce if synapse.dendrite is not None else None
         if nonce:
-            sent = nonce / 1e9  # validator's time.time_ns() just before sending
-            if now - MAX_NONCE_AGE <= sent <= now:
-                start = sent  # account for upload and axon verification time already spent
+            # The nonce is the validator's time.time_ns() just before sending. Credit the upload
+            # and axon verification already spent, capped so clock skew can't eat the budget.
+            in_transit = now - nonce / 1e9
+            if in_transit > 0:
+                start = now - min(in_transit, MAX_TRANSIT)
         margin = self.config.solver.safety_margin + 0.05 * timeout
         return max(MIN_BUDGET, start + timeout - margin - now)
 

@@ -106,13 +106,39 @@ def ensure_built(force: bool = False) -> Path:
         raise SolverError("Compiling clique_solver failed:\n" + "\n".join(errors))
 
 
+def binary() -> Path:
+    """The built solver, for the request path: never compiles, never blocks."""
+    if not BINARY.exists():
+        raise SolverError(f"solver binary missing: {BINARY} (run fast_solver.ensure_built())")
+    return BINARY
+
+
+# K4 minus one edge: maximum cliques are exactly {0,1,2} and {0,1,3}.
+_SELF_TEST_MATRIX = [[0, 1, 1, 1], [1, 0, 1, 1], [1, 1, 0, 0], [1, 1, 0, 0]]
+
+
+def self_test() -> None:
+    """Run the binary on a known graph; raises SolverError if it is broken (e.g. SIGILL from a
+    -march=native build copied to another CPU)."""
+    from CliqueAI.graph.codec import GraphCodec
+
+    encoded = GraphCodec().encode_matrix(_SELF_TEST_MATRIX)
+    result = solve(encoded, time_limit=0.05, threads=2, hard_timeout=10.0)
+    found = sorted(map(tuple, result.cliques))
+    if not result.complete or result.error or found != [(0, 1, 2), (0, 1, 3)]:
+        raise SolverError(
+            f"solver self-test failed: complete={result.complete} error={result.error} "
+            f"cliques={found}"
+        )
+
+
 # ----------------------------------------------------------------------------------------- run
 
 
 def _command(time_limit: float, threads: int, seed: int | None, report: int, extra: list[str]):
     seed = random.getrandbits(63) if seed is None else seed
     return [
-        str(ensure_built()),
+        str(binary()),
         "--time", f"{max(0.0, time_limit):.3f}",
         "--threads", str(max(1, threads)),
         "--seed", str(seed),
@@ -122,34 +148,49 @@ def _command(time_limit: float, threads: int, seed: int | None, report: int, ext
 
 
 def parse_output(text: str) -> SolverResult:
-    """Parse the solver's line protocol. Falls back to the best `B` line if output is partial."""
+    """Parse the solver's line protocol. Falls back to the best `B` line if output is partial.
+
+    A process killed mid-write can leave a truncated last line, which would be a non-maximal
+    "clique" scoring 0. So unterminated lines are dropped, B lines must match their declared
+    size, and only the largest R cliques are kept.
+    """
     result = SolverResult()
     best_partial: list[int] = []
     first_seen_ms: dict[int, float] = {}
-    for line in text.splitlines():
+    lines = text.split("\n")[:-1]  # the last element is "" or an unterminated fragment
+    for line in lines:
         tag, _, rest = line.partition(" ")
-        if tag == "N":
-            result.n = int(rest)
-        elif tag == "B":
-            parts = rest.split()
-            if len(parts) < 2:
-                continue
-            size, ms = int(parts[0]), float(parts[1])
-            first_seen_ms[size] = min(ms, first_seen_ms.get(size, ms))
-            if size > len(best_partial):
-                best_partial = [int(v) for v in parts[2:]]
-        elif tag == "R":
-            parts = [int(v) for v in rest.split()]
-            result.hits.append(parts[0])
-            result.cliques.append(parts[1:])
-        elif tag == "S":
-            for item in rest.split():
-                key, _, value = item.partition("=")
-                result.stats[key] = value
-        elif tag == "E":
-            result.complete = True
-        elif tag == "X":
-            result.error = rest
+        try:
+            if tag == "N":
+                result.n = int(rest)
+            elif tag == "B":
+                parts = rest.split()
+                size, ms = int(parts[0]), float(parts[1])
+                vertices = [int(v) for v in parts[2:]]
+                if len(vertices) != size:
+                    continue
+                first_seen_ms[size] = min(ms, first_seen_ms.get(size, ms))
+                if size > len(best_partial):
+                    best_partial = vertices
+            elif tag == "R":
+                parts = [int(v) for v in rest.split()]
+                if len(parts) >= 2:
+                    result.hits.append(parts[0])
+                    result.cliques.append(parts[1:])
+            elif tag == "S":
+                for item in rest.split():
+                    key, _, value = item.partition("=")
+                    result.stats[key] = value
+            elif tag == "E":
+                result.complete = True
+            elif tag == "X":
+                result.error = rest
+        except (ValueError, IndexError):
+            continue  # malformed line: ignore rather than lose the whole answer
+    if result.cliques:
+        best = max(len(c) for c in result.cliques)
+        kept = [(c, h) for c, h in zip(result.cliques, result.hits) if len(c) == best]
+        result.cliques, result.hits = [c for c, _ in kept], [h for _, h in kept]
     if not result.cliques and best_partial:
         result.cliques, result.hits = [best_partial], [1]
     result.best_size = max((len(c) for c in result.cliques), default=0)

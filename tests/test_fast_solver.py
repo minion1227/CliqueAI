@@ -166,3 +166,60 @@ def test_corrupt_input_reports_error():
     result = fast_solver.solve(load("general_0.2")[:-1], time_limit=0.5)
     assert result.error and "length mismatch" in result.error
     assert result.cliques == []
+
+
+def test_zero_budget_still_answers():
+    # Even if decoding uses the whole budget, one expansion runs: any valid answer beats none.
+    encoded = load("general_0.4")
+    result = fast_solver.solve(encoded, time_limit=0.0, threads=4)
+    assert result.complete and result.cliques
+    assert all(validator_accepts(encoded, c) for c in result.cliques)
+
+
+def test_parse_drops_truncated_and_smaller_lines():
+    text = "N 9\nB 3 0.1 0 1 2\nB 4 0.2 0 1 2\nR 1 0 1 2\nR 2 3 4 5 6\nR 1 3 4 5 7\nR 1 3 4"
+    result = fast_solver.parse_output(text)  # killed mid-line: no trailing newline, no E
+    assert not result.complete
+    assert result.cliques == [[3, 4, 5, 6], [3, 4, 5, 7]]  # truncated + smaller ones dropped
+    assert result.hits == [2, 1]
+    assert result.time_to_best_ms is None  # B 4 claimed 4 vertices but listed 3
+    partial = fast_solver.parse_output("N 9\nB 3 0.1 0 1 2\nB 5 0.2 1 2 3 4 5\nB 6 0.3 1 2")
+    assert partial.cliques == [[1, 2, 3, 4, 5]] and partial.best_size == 5
+
+
+def test_request_path_never_compiles(monkeypatch, tmp_path):
+    monkeypatch.setattr(fast_solver, "BINARY", tmp_path / "missing_solver")
+    start = time.monotonic()
+    with pytest.raises(fast_solver.SolverError):
+        asyncio.run(fast_solver.solve_async(load("general_0.1"), 1.0))
+    assert time.monotonic() - start < 0.5
+
+
+def test_self_test_passes():
+    fast_solver.self_test()
+
+
+def test_miner_defaults_and_budget():
+    import argparse
+    import types
+
+    from CliqueAI.miner import MAX_TRANSIT, Miner
+    from CliqueAI.protocol import MaximumCliqueOfLambdaGraph
+
+    parser = argparse.ArgumentParser()
+    Miner.add_args(parser)
+    args = vars(parser.parse_args([]))
+    assert args["neuron.autoupdate"] == 0, "a modified miner must not auto-update"
+    assert args["solver.pick"] == "rarest"
+
+    miner = Miner.__new__(Miner)
+    miner.config = types.SimpleNamespace(solver=types.SimpleNamespace(safety_margin=1.0))
+    syn = MaximumCliqueOfLambdaGraph(timeout=6.0)
+    full = 6.0 - 1.0 - 0.05 * 6.0
+    assert miner.time_budget(syn) == pytest.approx(full, abs=0.05)  # no nonce
+    syn.dendrite.nonce = time.time_ns() - int(0.4e9)  # 0.4 s in transit: credited
+    assert miner.time_budget(syn) == pytest.approx(full - 0.4, abs=0.05)
+    syn.dendrite.nonce = time.time_ns() - int(4e9)  # validator clock 4 s behind: capped
+    assert miner.time_budget(syn) == pytest.approx(full - MAX_TRANSIT, abs=0.05)
+    syn.dendrite.nonce = time.time_ns() + int(3e9)  # validator clock ahead: ignored
+    assert miner.time_budget(syn) == pytest.approx(full, abs=0.05)

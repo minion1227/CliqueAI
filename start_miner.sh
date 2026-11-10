@@ -15,7 +15,7 @@ python3.12 -m venv "$VENV_DIR"
 
 # Build the compiled clique solver now so a compiler problem stops startup instead of the miner
 # silently answering with the slow fallback.
-"$VENV_PYTHON" -c "from CliqueAI.clique_algorithms import fast_solver; print('clique solver:', fast_solver.ensure_built())"
+"$VENV_PYTHON" -c "from CliqueAI.clique_algorithms import fast_solver; print('clique solver:', fast_solver.ensure_built()); fast_solver.self_test(); print('clique solver self-test: ok')"
 
 pm2 delete "$PROCESS_NAME" >/dev/null 2>&1 || true
 pm2 start "$VENV_PYTHON" --name "$PROCESS_NAME" --cwd "$PROJECT_ROOT" --interpreter none -- \

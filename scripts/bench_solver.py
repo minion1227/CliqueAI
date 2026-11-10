@@ -100,12 +100,12 @@ def main():
             sizes = [r.best_size for r in runs]
             hits = sum(s >= ref.best_size for s in sizes)
             ttb = [r.time_to_best_ms for r in runs if r.time_to_best_ms is not None]
-            distinct = [len(r.cliques) for r in runs]
+            distinct = [int(r.stats.get("distinct", len(r.cliques))) for r in runs]
             print(
                 f"{name:<20}{ref.best_size:>5}{budget:>7.1f}s{hits:>4}/{len(runs):<2}"
                 f"{min(sizes):>7}-{max(sizes):<6}"
                 f"{statistics.median(ttb):>10.1f} (max {max(ttb):>7.0f})"
-                f"{statistics.median(distinct):>8.0f} (ref {len(ref.cliques)})"
+                f"{statistics.median(distinct):>8.0f} (ref {ref.stats.get('distinct', '?')})"
                 + base
             )
             base = ""
