@@ -170,3 +170,8 @@ bittensor_test/
 
 # act secrets
 .secrets
+
+# compiled clique solver (built on the mining host by fast_solver.ensure_built)
+CliqueAI/clique_algorithms/fast_solver/clique_solver
+CliqueAI/clique_algorithms/fast_solver/.clique_solver.*
+CliqueAI/clique_algorithms/fast_solver/.build.lock

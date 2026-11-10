@@ -13,3 +13,4 @@ PyYAML==6.0.2
 torch==2.7.1
 torch-geometric==2.6.1
 igraph
+ziglang==0.17.1

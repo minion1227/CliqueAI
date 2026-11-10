@@ -27,6 +27,23 @@ Exponential moving average algorithms continuously adjust miner reputation score
 ./start_miner.sh --wallet.name <coldkey-name> --wallet.hotkey <hotkey-name> --subtensor.network finney --netuid 83 --logging.info --axon.ip <your-miner-ip> --axon.port <your-miner-port>
 ```
 
+#### Clique solver
+
+The miner answers with a compiled local-search solver ([fast_solver](CliqueAI/clique_algorithms/fast_solver)). `start_miner.sh` builds it with `g++`/`clang++`, or with the pip `ziglang` toolchain when no system compiler exists. Each request:
+
+- runs in its own subprocess until shortly before the validator's timeout, so overlapping requests solve in parallel;
+- collects every distinct maximum clique it visits and returns a rarely-visited one, because identical answers share the diversity score;
+- always returns a *maximal* clique (validators score non-maximal cliques 0).
+
+Options: `--solver.threads` (0 = all cores, split across overlapping requests), `--solver.safety_margin` (seconds reserved for the network, default 1.0 plus 5% of the timeout), `--solver.pick rarest|random`, `--solver.schedule R,P,G` (local-search phase mix; the default random-only selection measured fastest on CliqueAI's random graphs).
+
+If you run a modified miner, pass `--neuron.autoupdate 0`. Auto-update pulls `origin/main` and restarts whenever your HEAD differs from it.
+
+```
+python -m pytest tests/test_fast_solver.py   # correctness against the validator's own checks
+python scripts/bench_solver.py               # solution quality at real tier sizes and budgets
+```
+
 ### Validator
 ```
 ./start_validator.sh --wallet.name <coldkey-name> --wallet.hotkey <hotkey-name> --subtensor.network finney --netuid 83 --logging.info --axon.ip <your-validator-ip> --axon.port <your-validator-port>
