@@ -12,10 +12,9 @@ import argparse
 import json
 import sys
 
-KEYS = [
-    "encoded_matrix", "miner_ans", "time_limit", "difficulty", "number_of_nodes",
-    "miner_hotkeys", "miner_coldkeys", "miner_uids", "miner_rewards", "timestamp",
-]  # fmt: skip
+# Rows must have REQUIRED; runs that also log the rest give coldkey and own-reward analysis.
+REQUIRED = ["encoded_matrix", "miner_ans", "time_limit", "difficulty", "miner_hotkeys"]
+KEYS = REQUIRED + ["number_of_nodes", "miner_coldkeys", "miner_uids", "miner_rewards", "timestamp", "uuid"]
 
 
 def main():
@@ -37,12 +36,16 @@ def main():
         for run in runs:
             got = 0
             try:
-                rows = run.scan_history(keys=KEYS, page_size=25)
-                for row in rows:
-                    out.write(json.dumps({k: row.get(k) for k in KEYS}) + "\n")
-                    got += 1
-                    written += 1
-                    if got >= per_run or written >= args.rounds:
+                for keys in (KEYS, REQUIRED):
+                    for row in run.scan_history(keys=keys, page_size=25):
+                        record = {k: row.get(k) for k in KEYS}
+                        record["run"] = run.name
+                        out.write(json.dumps(record) + "\n")
+                        got += 1
+                        written += 1
+                        if got >= per_run or written >= args.rounds:
+                            break
+                    if got:
                         break
             except Exception as e:  # one bad run should not stop the download
                 print(f"  run {run.name}: {type(e).__name__}: {e}", flush=True)

@@ -311,6 +311,48 @@ def choose_clique(
     return list(rng.choice([c for c, h in zip(result.cliques, result.hits) if h == fewest]))
 
 
+def distinct_best(result: SolverResult) -> int:
+    """How many distinct maximum cliques the search found (more than it may have reported)."""
+    try:
+        return max(int(result.stats["distinct"]), len(result.cliques))
+    except (KeyError, ValueError):
+        return len(result.cliques)  # killed before the S line
+
+
+def choose_answer(
+    result: SolverResult,
+    pick: str = "rarest",
+    near_max_cliques: int = 0,
+    rng: random.Random | None = None,
+) -> tuple[list[int], str]:
+    """Pick the answer to send: (clique, "max" | "near" | "none").
+
+    CliqueAI's reward is optimality * (1 + difficulty) + diversity, and the diversity part is split
+    between miners returning the identical clique. When a graph has only a few maximum cliques,
+    the other ~250 miners cover all of them, so a maximum clique shares its diversity with at least
+    one more miner. A maximal clique one vertex smaller is almost always unique; it keeps the full
+    diversity point and loses little optimality when few miners reach the maximum. A replay of
+    logged validator rounds (Nov 2026) favoured it when the search found at most 4 maximum
+    cliques; re-tune with scripts/replay_rounds.py.
+
+    `near_max_cliques` (0 = off) is that threshold. Near cliques come from the solver's `--near`
+    run, are verified maximal by it, and the least visited one is chosen (rarest = least likely to
+    be found by anyone else). Without one, or above the threshold, this returns a maximum clique.
+    """
+    rng = rng or random
+    if (
+        near_max_cliques > 0
+        and result.cliques
+        and result.near_cliques
+        and distinct_best(result) <= near_max_cliques
+    ):
+        fewest = min(result.near_hits)
+        rarest = [c for c, h in zip(result.near_cliques, result.near_hits) if h == fewest]
+        return list(rng.choice(rarest)), "near"
+    clique = choose_clique(result, pick, rng)
+    return clique, ("max" if clique else "none")
+
+
 def greedy_maximal_clique(
     adjacency_list: list[list[int]], rng: random.Random | None = None
 ) -> list[int]:

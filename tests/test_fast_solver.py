@@ -208,6 +208,52 @@ def test_near_best_cliques_are_valid():
     assert not fast_solver.solve(encoded, 0.3, threads=2).near_cliques  # off by default
 
 
+def test_choose_answer_near_rule():
+    result = fast_solver.SolverResult(
+        best_size=3,
+        cliques=[[0, 1, 2], [0, 1, 3]],
+        hits=[9, 4],
+        near_cliques=[[4, 5], [6, 7], [8, 9]],
+        near_hits=[3, 1, 1],
+        stats={"distinct": "2"},
+    )
+    rng = random.Random(0)
+    assert fast_solver.distinct_best(result) == 2
+    picks = {tuple(fast_solver.choose_answer(result, "rarest", 2, rng)[0]) for _ in range(50)}
+    assert picks == {(6, 7), (8, 9)}  # least-visited near cliques only
+    assert fast_solver.choose_answer(result, "rarest", 2, rng)[1] == "near"
+    assert fast_solver.choose_answer(result, "rarest", 1, rng) == ([0, 1, 3], "max")  # too many
+    assert fast_solver.choose_answer(result, "rarest", 0, rng) == ([0, 1, 3], "max")  # disabled
+    # More found than reported: the S line count decides, not the reported list.
+    result.stats["distinct"] = "300"
+    assert fast_solver.choose_answer(result, "rarest", 4, rng)[1] == "max"
+    # Killed before the S line: fall back to the reported count.
+    result.stats = {}
+    assert fast_solver.choose_answer(result, "rarest", 2, rng)[1] == "near"
+    # No near clique (e.g. complete graph, or killed before the Q lines): a maximum clique.
+    result.near_cliques, result.near_hits = [], []
+    assert fast_solver.choose_answer(result, "rarest", 4, rng) == ([0, 1, 3], "max")
+    assert fast_solver.choose_answer(fast_solver.SolverResult(), "rarest", 4, rng) == ([], "none")
+
+
+def test_near_answer_is_valid_and_one_smaller():
+    encoded = random_encoded(300, 0.7, 300)
+    result = fast_solver.solve(encoded, 1.0, threads=4, extra_args=["--near"])
+    k = fast_solver.distinct_best(result)
+    assert result.near_cliques and k >= 1
+    clique, kind = fast_solver.choose_answer(result, "rarest", k, random.Random(1))
+    assert kind == "near" and len(clique) == result.best_size - 1
+    assert validator_accepts(encoded, clique)
+    assert fast_solver.choose_answer(result, "rarest", k - 1, random.Random(1))[1] == "max"
+
+
+def test_complete_graph_has_no_near_answer():
+    encoded = random_encoded(12, 1.0, 0)  # K12: the only maximal clique is everything
+    result = fast_solver.solve(encoded, 0.2, threads=2, extra_args=["--near"])
+    assert result.cliques == [list(range(12))] and result.near_cliques == []
+    assert fast_solver.choose_answer(result, "rarest", 4) == (list(range(12)), "max")
+
+
 def test_miner_defaults_and_budget():
     import argparse
     import types
@@ -220,6 +266,7 @@ def test_miner_defaults_and_budget():
     args = vars(parser.parse_args([]))
     assert args["neuron.autoupdate"] == 0, "a modified miner must not auto-update"
     assert args["solver.pick"] == "rarest"
+    assert args["solver.near_max_cliques"] == 4
 
     miner = Miner.__new__(Miner)
     miner.config = types.SimpleNamespace(solver=types.SimpleNamespace(safety_margin=1.0))
