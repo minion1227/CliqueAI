@@ -33,10 +33,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
-# Rows must have REQUIRED; runs that also log the rest give coldkey and own-reward analysis.
-REQUIRED = ["encoded_matrix", "miner_ans", "time_limit", "difficulty", "miner_hotkeys"]
-KEYS = REQUIRED + ["miner_coldkeys", "miner_uids", "miner_rewards", "timestamp", "uuid"]
+from fetch_rounds import fetch_newest, hours_ago  # noqa: E402  (W&B access lives there)
+
 THRESHOLDS = [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32, 48, 64, 96, 128, 256]
 K_BUCKETS = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 8), (9, 16), (17, 32), (33, 64), (65, 128),
              (129, 256), (257, 10**9)]  # fmt: skip
@@ -45,25 +45,11 @@ K_BUCKETS = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 8), (9, 16), (17, 32), (33, 64)
 # ------------------------------------------------------------------------------------ sources
 
 
-def wandb_rows(project: str, limit: int, runs: int):
+def wandb_rows(project: str, limit: int, runs: int, max_age_hours: float):
     import wandb
 
-    api = wandb.Api(timeout=120)
-    got = 0
-    for run in list(api.runs(project, order="-created_at", per_page=runs))[:runs]:
-        for keys in (KEYS, REQUIRED):
-            rows = 0
-            for row in run.scan_history(keys=keys, page_size=25):
-                row = dict(row)
-                row["run"] = run.name
-                rows += 1
-                got += 1
-                yield row
-                if got >= limit:
-                    return
-            if rows:
-                break
-            print(f"run {run.name}: no rows with all of {keys}", flush=True)
+    log = lambda msg: print(msg, flush=True)  # noqa: E731
+    yield from fetch_newest(wandb.Api(timeout=120), project, limit, runs, max_age_hours, log)
 
 
 def file_rows(path: str, limit: int):
@@ -266,7 +252,7 @@ def policy_reward(r: dict, threshold: int) -> float:
 
 def analyse(results: list[dict]) -> None:
     n = len(results)
-    print(f"\n=== {n} rounds replayed")
+    print(f"\n=== {n} rounds replayed {hours_ago(results)}".rstrip())
     tiers = Counter(r["tier"] for r in results)
     print("tiers:", dict(sorted(tiers.items(), key=lambda t: int(t[0][:-1]))))
     beat = sum(r["ours_best"] > r["field_best"] for r in results)
@@ -346,7 +332,9 @@ def main():
     ap.add_argument("--load", help="analyse a replay saved with --save (no solving)")
     ap.add_argument("--save", help="write one JSON line of features per replayed round")
     ap.add_argument("--rounds", type=int, default=150)
-    ap.add_argument("--runs", type=int, default=12, help="most recent W&B runs to read")
+    ap.add_argument("--runs", type=int, default=12, help="most recently active W&B runs to read")
+    ap.add_argument("--max-age-hours", type=float, default=48,
+                    help="skip W&B runs that have not logged for this long")  # fmt: skip
     ap.add_argument("--hotkey", help="your miner hotkey: compare with its logged rewards")
     ap.add_argument("--threads", type=int, default=len(os.sched_getaffinity(0)))
     ap.add_argument("--safety-margin", type=float, default=1.0)
@@ -366,7 +354,7 @@ def main():
     fast_solver.ensure_built()
     rng = random.Random(0)
     source = (file_rows(args.rows, args.rounds) if args.rows
-              else wandb_rows(args.project, args.rounds, args.runs))  # fmt: skip
+              else wandb_rows(args.project, args.rounds, args.runs, args.max_age_hours))  # fmt: skip
     out = open(args.save, "w") if args.save else None
     results = []
     started = time.time()
